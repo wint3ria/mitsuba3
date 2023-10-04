@@ -12,10 +12,15 @@ SHAPE_ORDERING = [
     'obj',
     'ply',
     'serialized',
+    'cube'
     'sphere',
-    'cylinder',
     'disk',
+    'cylinder',
+    'bsplinecurve',
+    'linearcurve',
     'rectangle',
+    'cube',
+    'sdfgrid',
     'shapegroup',
     'instance'
 ]
@@ -27,9 +32,11 @@ BSDF_ORDERING = [
     'roughdielectric',
     'conductor',
     'roughconductor',
+    'hair',
+    'measured',
+    'measured_polarized',
     'plastic',
     'roughplastic',
-    'measured',
     'bumpmap',
     'normalmap',
     'blendbsdf',
@@ -39,7 +46,6 @@ BSDF_ORDERING = [
     'polarizer',
     'retarder',
     'circular',
-    'measured_polarized',
     'pplastic'
 ]
 

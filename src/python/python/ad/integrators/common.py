@@ -64,6 +64,8 @@ class ADIntegrator(mi.CppADIntegrator):
         if isinstance(sensor, int):
             sensor = scene.sensors()[sensor]
 
+        film = sensor.film()
+
         # Disable derivatives in all of the following
         with dr.suspend_grad():
             # Prepare the film and sample generator for rendering
@@ -91,28 +93,27 @@ class ADIntegrator(mi.CppADIntegrator):
             )
 
             # Prepare an ImageBlock as specified by the film
-            block = sensor.film().create_block()
+            block = film.create_block()
 
             # Only use the coalescing feature when rendering enough samples
             block.set_coalesce(block.coalesce() and spp >= 4)
 
             # Accumulate into the image block
-            alpha = dr.select(valid, mi.Float(1), mi.Float(0))
-            if mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special):
-                aovs = sensor.film().prepare_sample(L * weight, ray.wavelengths,
-                                                    block.channel_count(), alpha=alpha)
-                block.put(pos, aovs)
-                del aovs
-            else:
-                block.put(pos, ray.wavelengths, L * weight, alpha)
+            ADIntegrator._splat_to_block(
+                block, film, pos,
+                value=L * weight,
+                weight=1.0,
+                alpha=dr.select(valid, mi.Float(1), mi.Float(0)),
+                wavelengths=ray.wavelengths
+            )
 
             # Explicitly delete any remaining unused variables
-            del sampler, ray, weight, pos, L, valid, alpha
+            del sampler, ray, weight, pos, L, valid
             gc.collect()
 
             # Perform the weight division and return an image tensor
-            sensor.film().put_block(block)
-            self.primal_image = sensor.film().develop()
+            film.put_block(block)
+            self.primal_image = film.develop()
 
             return self.primal_image
 
@@ -172,21 +173,13 @@ class ADIntegrator(mi.CppADIntegrator):
                 #   Σ (fi Li det)
                 #  ---------------
                 #   Σ (fi det)
-                if (dr.all(mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special))):
-                    aovs = sensor.film().prepare_sample(L * weight * det, ray.wavelengths,
-                                                        block.channel_count(),
-                                                        weight=det,
-                                                        alpha=dr.select(valid, mi.Float(1), mi.Float(0)))
-                    block.put(pos, aovs)
-                    del aovs
-                else:
-                    block.put(
-                        pos=pos,
-                        wavelengths=ray.wavelengths,
-                        value=L * weight * det,
-                        weight=det,
-                        alpha=dr.select(valid, mi.Float(1), mi.Float(0))
-                    )
+                ADIntegrator._splat_to_block(
+                    block, film, pos,
+                    value=L * weight * det,
+                    weight=det,
+                    alpha=dr.select(valid, mi.Float(1), mi.Float(0)),
+                    wavelengths=ray.wavelengths
+                )
 
                 # Perform the weight division and return an image tensor
                 film.put_block(block)
@@ -251,30 +244,22 @@ class ADIntegrator(mi.CppADIntegrator):
                 block.set_coalesce(block.coalesce() and spp >= 4)
 
                 # Accumulate into the image block
-                if mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special):
-                    aovs = sensor.film().prepare_sample(L * weight * det, ray.wavelengths,
-                                                        block.channel_count(),
-                                                        weight=det,
-                                                        alpha=dr.select(valid, mi.Float(1), mi.Float(0)))
-                    block.put(pos, aovs)
-                    del aovs
-                else:
-                    block.put(
-                        pos=pos,
-                        wavelengths=ray.wavelengths,
-                        value=L * weight * det,
-                        weight=det,
-                        alpha=dr.select(valid, mi.Float(1), mi.Float(0))
-                    )
+                ADIntegrator._splat_to_block(
+                    block, film, pos,
+                    value=L * weight * det,
+                    weight=det,
+                    alpha=dr.select(valid, mi.Float(1), mi.Float(0)),
+                    wavelengths=ray.wavelengths
+                )
 
-                sensor.film().put_block(block)
+                film.put_block(block)
 
                 del valid
                 gc.collect()
 
                 # This step launches a kernel
                 dr.schedule(block.tensor())
-                image = sensor.film().develop()
+                image = film.develop()
 
                 # Differentiate sample splatting and weight division steps to
                 # retrieve the adjoint radiance
@@ -476,6 +461,30 @@ class ADIntegrator(mi.CppADIntegrator):
         film.prepare(aovs)
 
         return sampler, spp
+
+    def _splat_to_block(block: mi.ImageBlock,
+                       film: mi.Film,
+                       pos: mi.Point2f,
+                       value: mi.Spectrum,
+                       weight: mi.Float,
+                       alpha: mi.Float,
+                       wavelengths: mi.Spectrum):
+        '''Helper function to splat values to a imageblock'''
+        if (dr.all(mi.has_flag(film.flags(), mi.FilmFlags.Special))):
+            aovs = film.prepare_sample(value, wavelengths,
+                                        block.channel_count(),
+                                        weight=weight,
+                                        alpha=alpha)
+            block.put(pos, aovs)
+            del aovs
+        else:
+            block.put(
+                pos=pos,
+                wavelengths=wavelengths,
+                value=value,
+                weight=weight,
+                alpha=alpha
+            )
 
     def sample(self,
                mode: dr.ADMode,
@@ -680,6 +689,19 @@ class RBIntegrator(ADIntegrator):
                 active=mi.Bool(True)
             )
 
+            # Launch the Monte Carlo sampling process in forward mode (2)
+            δL, valid_2, state_out_2 = self.sample(
+                mode=dr.ADMode.Forward,
+                scene=scene,
+                sampler=sampler,
+                ray=ray,
+                depth=mi.UInt32(0),
+                δL=None,
+                state_in=state_out,
+                reparam=reparam,
+                active=mi.Bool(True)
+            )
+
             # Differentiable camera pose parameters or a reparameterization
             # have an effect on the measurement integral performed at the
             # sensor. We account for this here by differentiating the
@@ -701,56 +723,23 @@ class RBIntegrator(ADIntegrator):
                     sample_pos_deriv.set_coalesce(sample_pos_deriv.coalesce() and spp >= 4)
 
                     # Deposit samples with gradient tracking for 'pos'.
-                    if (dr.all(mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special))):
-                        aovs = sensor.film().prepare_sample(L * weight * det, ray.wavelengths,
-                                                            sample_pos_deriv.channel_count(),
-                                                            weight=det,
-                                                            alpha=dr.select(valid, mi.Float(1), mi.Float(0)))
-                        sample_pos_deriv.put(pos, aovs)
-                        del aovs
-                    else:
-                        sample_pos_deriv.put(
-                            pos=pos,
-                            wavelengths=ray.wavelengths,
-                            value=L * weight * det,
-                            weight=det,
-                            alpha=dr.select(valid, mi.Float(1), mi.Float(0))
-                        )
+                    ADIntegrator._splat_to_block(
+                        sample_pos_deriv, film, pos,
+                        value=L * weight * det,
+                        weight=det,
+                        alpha=dr.select(valid, mi.Float(1), mi.Float(0)),
+                        wavelengths=ray.wavelengths
+                    )
 
                     # Compute the derivative of the reparameterized image ..
                     tensor = sample_pos_deriv.tensor()
-                    dr.forward_to(tensor,
-                                  flags=dr.ADFlag.ClearInterior | dr.ADFlag.ClearEdges)
+                    dr.forward_to(tensor, flags=dr.ADFlag.ClearInterior | dr.ADFlag.ClearEdges)
 
                     dr.schedule(tensor, dr.grad(tensor))
 
                     # Done with this part, let's detach the image-space position
                     dr.disable_grad(pos)
                     del tensor
-
-            # Probably a little overkill, but why not.. If there are any
-            # DrJit arrays to be collected by Python's cyclic GC, then
-            # freeing them may enable loop simplifications in dr.eval().
-            gc.collect()
-
-            # Launch a kernel with everything so far
-            dr.eval(state_out)
-
-            # Garbage collect unused values to simplify kernel about to be run
-            del L, valid, params
-
-            # Launch the Monte Carlo sampling process in forward mode
-            δL, valid_2, state_out_2 = self.sample(
-                mode=dr.ADMode.Forward,
-                scene=scene,
-                sampler=sampler,
-                ray=ray,
-                depth=mi.UInt32(0),
-                δL=None,
-                state_in=state_out,
-                reparam=reparam,
-                active=mi.Bool(True)
-            )
 
             # Prepare an ImageBlock as specified by the film
             block = film.create_block()
@@ -759,27 +748,24 @@ class RBIntegrator(ADIntegrator):
             block.set_coalesce(block.coalesce() and spp >= 4)
 
             # Accumulate into the image block
-            if (dr.all(mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special))):
-                aovs = sensor.film().prepare_sample(δL * weight, ray.wavelengths,
-                                                    block.channel_count(),
-                                                    alpha=dr.select(valid_2, mi.Float(1), mi.Float(0)))
-                block.put(pos, aovs)
-                del aovs
-            else:
-                block.put(
-                    pos=pos,
-                    wavelengths=ray.wavelengths,
-                    value=δL * weight,
-                    alpha=dr.select(valid_2, mi.Float(1), mi.Float(0))
-                )
+            ADIntegrator._splat_to_block(
+                block, film, pos,
+                value=δL * weight,
+                weight=1.0,
+                alpha=dr.select(valid_2, mi.Float(1), mi.Float(0)),
+                wavelengths=ray.wavelengths
+            )
 
             # Perform the weight division and return an image tensor
             film.put_block(block)
 
             # Explicitly delete any remaining unused variables
-            del sampler, ray, weight, pos, δL, valid_2, \
+            del sampler, ray, weight, pos, L, valid, δL, valid_2, params, \
                 state_out, state_out_2, block
 
+            # Probably a little overkill, but why not.. If there are any
+            # DrJit arrays to be collected by Python's cyclic GC, then
+            # freeing them may enable loop simplifications in dr.eval().
             gc.collect()
 
             result_grad = film.develop()
@@ -787,7 +773,7 @@ class RBIntegrator(ADIntegrator):
             # Potentially add the derivative of the reparameterized samples
             if sample_pos_deriv is not None:
                 with dr.resume_grad():
-                    film.prepare(aovs)
+                    film.clear()
                     film.put_block(sample_pos_deriv)
                     reparam_result = film.develop()
                     dr.forward_to(reparam_result)
@@ -882,6 +868,59 @@ class RBIntegrator(ADIntegrator):
             ray, weight, pos, det = self.sample_rays(scene, sensor,
                                                      sampler, reparam)
 
+            def splatting_and_backward_gradient_image(value: mi.Spectrum,
+                                                      weight: mi.Float,
+                                                      alpha: mi.Float):
+                '''
+                Backward propagation of the gradient image through the sample
+                splatting and weight division steps.
+                '''
+
+                # Prepare an ImageBlock as specified by the film
+                block = film.create_block()
+
+                # Only use the coalescing feature when rendering enough samples
+                block.set_coalesce(block.coalesce() and spp >= 4)
+
+                ADIntegrator._splat_to_block(
+                    block, film, pos,
+                    value=value,
+                    weight=weight,
+                    alpha=alpha,
+                    wavelengths=ray.wavelengths
+                )
+
+                film.put_block(block)
+
+                # Probably a little overkill, but why not.. If there are any
+                # DrJit arrays to be collected by Python's cyclic GC, then
+                # freeing them may enable loop simplifications in dr.eval().
+                gc.collect()
+
+                image = film.develop()
+
+                dr.set_grad(image, grad_in)
+                dr.enqueue(dr.ADMode.Backward, image)
+                dr.traverse(mi.Float, dr.ADMode.Backward)
+
+            # Differentiate sample splatting and weight division steps to
+            # retrieve the adjoint radiance (e.g. 'δL')
+            with dr.resume_grad():
+                with dr.suspend_grad(pos, det, ray, weight):
+                    L = dr.full(mi.Spectrum, 1.0, dr.width(ray))
+                    dr.enable_grad(L)
+
+                    splatting_and_backward_gradient_image(
+                        value=L * weight,
+                        weight=1.0,
+                        alpha=1.0
+                    )
+
+                    δL = dr.grad(L)
+
+            # Clear the dummy data splatted on the film above
+            film.clear()
+
             # Launch the Monte Carlo sampling process in primal mode (1)
             L, valid, state_out = self.sample(
                 mode=dr.ADMode.Primal,
@@ -894,55 +933,6 @@ class RBIntegrator(ADIntegrator):
                 reparam=None,
                 active=mi.Bool(True)
             )
-
-            # Prepare an ImageBlock as specified by the film
-            block = film.create_block()
-
-            # Only use the coalescing feature when rendering enough samples
-            block.set_coalesce(block.coalesce() and spp >= 4)
-
-            with dr.resume_grad():
-                dr.enable_grad(L)
-
-                # Accumulate into the image block.
-                # After reparameterizing the camera ray, we need to evaluate
-                #   Σ (fi Li det)
-                #  ---------------
-                #   Σ (fi det)
-                if (dr.all(mi.has_flag(sensor.film().flags(), mi.FilmFlags.Special))):
-                    aovs = sensor.film().prepare_sample(L * weight * det, ray.wavelengths,
-                                                        block.channel_count(),
-                                                        weight=det,
-                                                        alpha=dr.select(valid, mi.Float(1), mi.Float(0)))
-                    block.put(pos, aovs)
-                    del aovs
-                else:
-                    block.put(
-                        pos=pos,
-                        wavelengths=ray.wavelengths,
-                        value=L * weight * det,
-                        weight=det,
-                        alpha=dr.select(valid, mi.Float(1), mi.Float(0))
-                    )
-
-                sensor.film().put_block(block)
-
-                # Probably a little overkill, but why not.. If there are any
-                # DrJit arrays to be collected by Python's cyclic GC, then
-                # freeing them may enable loop simplifications in dr.eval().
-                del valid
-                gc.collect()
-
-                # This step launches a kernel
-                dr.schedule(state_out, block.tensor())
-                image = sensor.film().develop()
-
-                # Differentiate sample splatting and weight division steps to
-                # retrieve the adjoint radiance
-                dr.set_grad(image, grad_in)
-                dr.enqueue(dr.ADMode.Backward, image)
-                dr.traverse(mi.Float, dr.ADMode.Backward)
-                δL = dr.grad(L)
 
             # Launch Monte Carlo sampling in backward AD mode (2)
             L_2, valid_2, state_out_2 = self.sample(
@@ -957,194 +947,28 @@ class RBIntegrator(ADIntegrator):
                 active=mi.Bool(True)
             )
 
+            # Propagate gradient image to sample positions if necessary
+            if reparam is not None:
+                with dr.resume_grad():
+                    # Accumulate into the image block.
+                    # After reparameterizing the camera ray, we need to evaluate
+                    #   Σ (fi Li det)
+                    #  ---------------
+                    #   Σ (fi det)
+                    splatting_and_backward_gradient_image(
+                        value=L * weight * det,
+                        weight=det,
+                        alpha=dr.select(valid, mi.Float(1), mi.Float(0))
+                    )
+
             # We don't need any of the outputs here
             del L_2, valid_2, state_out, state_out_2, δL, \
-                ray, weight, pos, block, sampler
+                ray, weight, pos, sampler
 
             gc.collect()
 
             # Run kernel representing side effects of the above
             dr.eval()
-
-# ---------------------------------------------------------------------------
-# Default implementation of Integrator.render_forward/backward
-# ---------------------------------------------------------------------------
-
-def render_forward(self: mi.Integrator,
-                   scene: mi.Scene,
-                   params: Any,
-                   sensor: Union[int, mi.Sensor] = 0,
-                   seed: int = 0,
-                   spp: int = 0) -> mi.TensorXf:
-    """
-    Evaluates the forward-mode derivative of the rendering step.
-
-    Forward-mode differentiation propagates gradients from scene parameters
-    through the simulation, producing a *gradient image* (i.e., the derivative
-    of the rendered image with respect to those scene parameters). The gradient
-    image is very helpful for debugging, for example to inspect the gradient
-    variance or visualize the region of influence of a scene parameter. It is
-    not particularly useful for simultaneous optimization of many parameters,
-    since multiple differentiation passes are needed to obtain separate
-    derivatives for each scene parameter. See ``Integrator.render_backward()``
-    for an efficient way of obtaining all parameter derivatives at once, or
-    simply use the ``mi.render()`` abstraction that hides both
-    ``Integrator.render_forward()`` and ``Integrator.render_backward()`` behind
-    a unified interface.
-
-    Before calling this function, you must first enable gradient tracking and
-    furthermore associate concrete input gradients with one or more scene
-    parameters, or the function will just return a zero-valued gradient image.
-    This is typically done by invoking ``dr.enable_grad()`` and
-    ``dr.set_grad()`` on elements of the ``SceneParameters`` data structure
-    that can be obtained obtained via a call to ``mi.traverse()``.
-
-    Note the default implementation of this functionality relies on naive
-    automatic differentiation (AD), which records a computation graph of the
-    primal rendering step that is subsequently traversed to propagate
-    derivatives. This tends to be relatively inefficient due to the need to
-    track intermediate program state. In particular, it means that
-    differentiation of nontrivial scenes at high sample counts will often run
-    out of memory. Integrators like ``rb`` (Radiative Backpropagation) and
-    ``prb`` (Path Replay Backpropagation) that are specifically designed for
-    differentiation can be significantly more efficient.
-
-    Parameter ``scene`` (``mi.Scene``):
-        The scene to be rendered differentially.
-
-    Parameter ``params``:
-       An arbitrary container of scene parameters that should receive
-       gradients. Typically this will be an instance of type
-       ``mi.SceneParameters`` obtained via ``mi.traverse()``. However, it could
-       also be a Python list/dict/object tree (DrJit will traverse it to find
-       all parameters). Gradient tracking must be explicitly enabled for each of
-       these parameters using ``dr.enable_grad(params['parameter_name'])`` (i.e.
-       ``render_forward()`` will not do this for you). Furthermore,
-       ``dr.set_grad(...)`` must be used to associate specific gradient values
-       with each parameter.
-
-    Parameter ``sensor`` (``int``, ``mi.Sensor``):
-        Specify a sensor or a (sensor index) to render the scene from a
-        different viewpoint. By default, the first sensor within the scene
-        description (index 0) will take precedence.
-
-    Parameter ``seed` (``int``)
-        This parameter controls the initialization of the random number
-        generator. It is crucial that you specify different seeds (e.g., an
-        increasing sequence) if subsequent calls should produce statistically
-        independent images (e.g. to de-correlate gradient-based optimization
-        steps).
-
-    Parameter ``spp`` (``int``):
-        Optional parameter to override the number of samples per pixel for the
-        differential rendering step. The value provided within the original
-        scene specification takes precedence if ``spp=0``.
-    """
-
-    # Recorded loops cannot be differentiated, so let's disable them
-    with dr.scoped_set_flag(dr.JitFlag.LoopRecord, False):
-        image = self.render(
-            scene=scene,
-            sensor=sensor,
-            seed=seed,
-            spp=spp,
-            develop=True,
-            evaluate=False
-        )
-
-        # Perform an AD traversal of all registered AD variables that
-        # influence 'image' in a differentiable manner
-        dr.forward_to(image)
-
-        return dr.grad(image)
-
-def render_backward(self: mi.Integrator,
-                    scene: mi.Scene,
-                    params: Any,
-                    grad_in: mi.TensorXf,
-                    sensor: Union[int, mi.Sensor] = 0,
-                    seed: int = 0,
-                    spp: int = 0) -> None:
-    """
-    Evaluates the reverse-mode derivative of the rendering step.
-
-    Reverse-mode differentiation transforms image-space gradients into scene
-    parameter gradients, enabling simultaneous optimization of scenes with
-    millions of free parameters. The function is invoked with an input
-    *gradient image* (``grad_in``) and transforms and accumulates these into
-    the gradient arrays of scene parameters that previously had gradient
-    tracking enabled.
-
-    Before calling this function, you must first enable gradient tracking for
-    one or more scene parameters, or the function will not do anything. This is
-    typically done by invoking ``dr.enable_grad()`` on elements of the
-    ``SceneParameters`` data structure that can be obtained obtained via a call
-    to ``mi.traverse()``. Use ``dr.grad()`` to query the resulting gradients of
-    these parameters once ``render_backward()`` returns.
-
-    Note the default implementation of this functionality relies on naive
-    automatic differentiation (AD), which records a computation graph of the
-    primal rendering step that is subsequently traversed to propagate
-    derivatives. This tends to be relatively inefficient due to the need to
-    track intermediate program state. In particular, it means that
-    differentiation of nontrivial scenes at high sample counts will often run
-    out of memory. Integrators like ``rb`` (Radiative Backpropagation) and
-    ``prb`` (Path Replay Backpropagation) that are specifically designed for
-    differentiation can be significantly more efficient.
-
-    Parameter ``scene`` (``mi.Scene``):
-        The scene to be rendered differentially.
-
-    Parameter ``params``:
-       An arbitrary container of scene parameters that should receive
-       gradients. Typically this will be an instance of type
-       ``mi.SceneParameters`` obtained via ``mi.traverse()``. However, it could
-       also be a Python list/dict/object tree (DrJit will traverse it to find
-       all parameters). Gradient tracking must be explicitly enabled for each of
-       these parameters using ``dr.enable_grad(params['parameter_name'])`` (i.e.
-       ``render_backward()`` will not do this for you).
-
-    Parameter ``grad_in`` (``mi.TensorXf``):
-        Gradient image that should be back-propagated.
-
-    Parameter ``sensor`` (``int``, ``mi.Sensor``):
-        Specify a sensor or a (sensor index) to render the scene from a
-        different viewpoint. By default, the first sensor within the scene
-        description (index 0) will take precedence.
-
-    Parameter ``seed` (``int``)
-        This parameter controls the initialization of the random number
-        generator. It is crucial that you specify different seeds (e.g., an
-        increasing sequence) if subsequent calls should produce statistically
-        independent images (e.g. to de-correlate gradient-based optimization
-        steps).
-
-    Parameter ``spp`` (``int``):
-        Optional parameter to override the number of samples per pixel for the
-        differential rendering step. The value provided within the original
-        scene specification takes precedence if ``spp=0``.
-    """
-
-    # Recorded loops cannot be differentiated, so let's disable them
-    with dr.scoped_set_flag(dr.JitFlag.LoopRecord, False):
-        image = self.render(
-            scene=scene,
-            sensor=sensor,
-            seed=seed,
-            spp=spp,
-            develop=True,
-            evaluate=False
-        )
-
-        # Process the computation graph using reverse-mode AD
-        dr.backward_from(image * grad_in)
-
-# Monkey-patch render_forward/backward into the Integrator base class
-mi.Integrator.render_backward = render_backward
-mi.Integrator.render_forward = render_forward
-
-del render_backward
-del render_forward
 
 # ------------------------------------------------------------------------------
 

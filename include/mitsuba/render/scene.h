@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mitsuba/core/distr_1d.h>
 #include <mitsuba/core/spectrum.h>
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/shapegroup.h>
@@ -35,8 +36,9 @@ NAMESPACE_BEGIN(mitsuba)
 template <typename Float, typename Spectrum>
 class MI_EXPORT_LIB Scene : public Object {
 public:
-    MI_IMPORT_TYPES(BSDF, Emitter, EmitterPtr, Film, Sampler, Shape, ShapePtr,
-                    ShapeGroup, Sensor, Integrator, Medium, MediumPtr, Mesh)
+    MI_IMPORT_TYPES(BSDF, Emitter, EmitterPtr, SensorPtr, Film, Sampler, Shape,
+                    ShapePtr, ShapeGroup, Sensor, Integrator, Medium, MediumPtr,
+                    Mesh)
 
     /// Instantiate a scene from a \ref Properties object
     Scene(const Properties &props);
@@ -475,11 +477,14 @@ public:
     /// Return the scene's integrator
     const Integrator* integrator() const { return m_integrator; }
 
-    /// Return the list of emitters as an Dr.Jit array
+    /// Return the list of emitters as a Dr.Jit array
     const DynamicBuffer<EmitterPtr> &emitters_dr() const { return m_emitters_dr; }
 
-    /// Return the list of shapes as an Dr.Jit array
+    /// Return the list of shapes as a Dr.Jit array
     const DynamicBuffer<ShapePtr> &shapes_dr() const { return m_shapes_dr; }
+
+    /// Return the list of sensors as a Dr.Jit array
+    const DynamicBuffer<SensorPtr> &sensors_dr() const { return m_sensors_dr; }
 
     //! @}
     // =============================================================
@@ -554,6 +559,9 @@ protected:
 
     using ShapeKDTree = mitsuba::ShapeKDTree<Float, Spectrum>;
 
+    /// Updates the discrete distribution used to select an emitter
+    void update_emitter_sampling_distribution();
+
 protected:
     /// Acceleration data structure (IAS) (type depends on implementation)
     void *m_accel = nullptr;
@@ -568,10 +576,12 @@ protected:
     DynamicBuffer<ShapePtr> m_shapes_dr;
     std::vector<ref<ShapeGroup>> m_shapegroups;
     std::vector<ref<Sensor>> m_sensors;
+    DynamicBuffer<SensorPtr> m_sensors_dr;
     std::vector<ref<Object>> m_children;
     ref<Integrator> m_integrator;
     ref<Emitter> m_environment;
     ScalarFloat m_emitter_pmf;
+    std::unique_ptr<DiscreteDistribution<Float>> m_emitter_distr = nullptr;
 
     bool m_shapes_grad_enabled;
 };

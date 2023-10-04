@@ -1,3 +1,4 @@
+#include <mitsuba/core/stream.h>
 #include <mitsuba/core/struct.h>
 #include <mitsuba/core/properties.h>
 #include <mitsuba/render/bsdf.h>
@@ -21,7 +22,7 @@ public:
         : Mesh(name, vertex_count, face_count, props, has_vertex_normals,
                has_vertex_texcoords) {}
     std::string to_string() const override {
-        PYBIND11_OVERRIDE(std::string, Mesh, to_string,);
+        PYBIND11_OVERRIDE(std::string, Mesh, to_string);
     }
 };
 
@@ -55,6 +56,11 @@ template <typename Ptr, typename Cls> void bind_shape_generic(Cls &cls) {
             },
             "ray"_a, "pi"_a, "ray_flags"_a = +RayFlags::All,
             "active"_a = true, D(Shape, compute_surface_interaction))
+       .def("has_attribute",
+            [](Ptr shape, const std::string &name, const Mask &active) {
+                return shape->has_attribute(name, active);
+            },
+            "name"_a, "active"_a = true, D(Shape, has_attribute))
        .def("eval_attribute",
             [](Ptr shape, const std::string &name,
                const SurfaceInteraction3f &si, const Mask &active) {
@@ -74,15 +80,10 @@ template <typename Ptr, typename Cls> void bind_shape_generic(Cls &cls) {
             },
             "name"_a, "si"_a, "active"_a = true, D(Shape, eval_attribute_3))
        .def("ray_intersect_preliminary",
-            [](Ptr shape, const Ray3f &ray, const Mask &active) {
-                return shape->ray_intersect_preliminary(ray, active);
+            [](Ptr shape, const Ray3f &ray, uint32_t prim_index, const Mask &active) {
+                return shape->ray_intersect_preliminary(ray, prim_index, active);
             },
-            "ray"_a, "active"_a = true, D(Shape, ray_intersect_preliminary))
-       .def("ray_intersect_preliminary",
-            [](Ptr shape, const Ray3f &ray, const Mask &active) {
-                return shape->ray_intersect_preliminary(ray, active);
-            },
-            "ray"_a, "active"_a = true, D(Shape, ray_intersect_preliminary))
+            "ray"_a, "prim_index"_a = 0, "active"_a = true, D(Shape, ray_intersect_preliminary))
        .def("ray_intersect",
             [](Ptr shape, const Ray3f &ray, uint32_t flags, const Mask &active) {
                 return shape->ray_intersect(ray, flags, active);
@@ -91,7 +92,7 @@ template <typename Ptr, typename Cls> void bind_shape_generic(Cls &cls) {
             D(Shape, ray_intersect))
        .def("ray_test",
             [](Ptr shape, const Ray3f &ray, const Mask &active) {
-                return shape->ray_test(ray, active);
+                return shape->ray_test(ray, 0, active);
             },
             "ray"_a, "active"_a = true, D(Shape, ray_test))
        .def("sample_position",
@@ -173,8 +174,12 @@ MI_PY_EXPORT(Shape) {
         .def_method(Mesh, face_count)
         .def_method(Mesh, has_vertex_normals)
         .def_method(Mesh, has_vertex_texcoords)
-        .def("write_ply", &Mesh::write_ply, "filename"_a,
-             "Export mesh as a binary PLY file")
+        .def("write_ply",
+             py::overload_cast<const std::string &>(&Mesh::write_ply, py::const_),
+             "filename"_a, D(Mesh, write_ply))
+        .def("write_ply",
+             py::overload_cast<Stream *>(&Mesh::write_ply, py::const_),
+             "stream"_a, D(Mesh, write_ply, 2))
         .def("add_attribute", &Mesh::add_attribute, "name"_a, "size"_a, "buffer"_a,
              D(Mesh, add_attribute), py::return_value_policy::reference_internal)
         .def("vertex_position", [](const Mesh &m, UInt32 index, Mask active) {
