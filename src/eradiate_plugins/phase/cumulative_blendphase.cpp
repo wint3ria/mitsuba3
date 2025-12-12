@@ -19,7 +19,7 @@ public:
         for (auto &prop : props.objects()) {
             if (Base *phase = prop.try_get<Base>()) {
                 m_nested_phases.push_back(phase);
-                m_weights.push_back(props.volume<Volume>("weight_" + std::to_string(phase_count)));
+                m_weights.push_back(props.get_volume<Volume>("weight_" + std::to_string(phase_count)));
                 phase_count++;
             }
         }
@@ -67,7 +67,7 @@ public:
 
         cdf[0] = 0.f;
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
-            weight_values[i] = eval_weight(mi, active);
+            weight_values[i] = eval_weight(mi, i, active);
             weight_sum += weight_values[i];
             cdf[i + 1] = weight_sum;
         }
@@ -75,7 +75,7 @@ public:
 
         if (unlikely(ctx.component != (uint32_t) -1)) {
             PhaseFunctionContext ctx2(ctx);
-            const m_nested_phases_index::const_iterator position = std::upper_bound(
+            const std::vector<uint32_t>::const_iterator position = std::upper_bound(
                 m_nested_phases_index.begin(),
                 m_nested_phases_index.end(), 
                 ctx.component
