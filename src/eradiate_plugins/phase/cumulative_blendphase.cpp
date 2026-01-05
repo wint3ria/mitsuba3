@@ -119,24 +119,37 @@ public:
         MI_MASKED_FUNCTION(ProfilerPhase::PhaseFunctionEvaluate, active);
 
         Float weight_sum = 0.f, inv_weight_sum;
-        std::vector<Float> cumulative_weights;
-        cumulative_weights.reserve(m_nested_phases.size());
+        std::vector<Float> weight_values;
+        weight_values.reserve(m_nested_phases.size());
         std::pair<Spectrum, Float> result = { Spectrum(0.f), 0.f }, temp;
 
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
-            cumulative_weights.push_back(eval_weight(mi, i, active));
-            weight_sum += cumulative_weights.back();
+            weight_values.push_back(eval_weight(mi, i, active));
+            weight_sum += weight_values.back();
         }
         inv_weight_sum = 1.f / weight_sum;
 
         if (unlikely(ctx.component != (uint32_t) -1)) {
-            throw "WIP";
+            PhaseFunctionContext ctx2(ctx);
+            const std::vector<uint32_t>::const_iterator position = std::upper_bound(
+                m_nested_phases_index.begin(),
+                m_nested_phases_index.end(), 
+                ctx.component
+            );
+            const size_t index = std::distance(m_nested_phases_index.begin(), position) - 1;
+            ctx2.component = ctx.component - m_nested_phases_index[index];
+            result = m_nested_phases[index]->eval_pdf(
+                ctx2, mi, wo, active);
+            const Float phase_weight = weight_values[index] * inv_weight_sum;
+
+            std::get<0>(result) *= phase_weight;
+            std::get<1>(result) *= phase_weight;
             return result;
         }
 
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
             temp = m_nested_phases[i]->eval_pdf(ctx, mi, wo, active);
-            const Float phase_weight = cumulative_weights[i] * inv_weight_sum;
+            const Float phase_weight = weight_values[i] * inv_weight_sum;
             dr::masked(std::get<0>(result), active) += std::get<0>(temp) * phase_weight;
             dr::masked(std::get<1>(result), active) += std::get<1>(temp) * phase_weight;
         }
@@ -146,11 +159,13 @@ public:
 
     std::string to_string() const override {
         std::ostringstream oss;
-        throw "WIP";
+         oss << "CumulativeBlendPhaseFunction[" << std::endl
+            << "  weights = " << string::indent(m_weights) << "," << std::endl
+            << "]";
         return oss.str();
     }
 
-    MI_DECLARE_CLASS(BlendPhaseFunction)
+    MI_DECLARE_CLASS(CumulativeBlendPhaseFunction)
 protected:
     std::vector<ref<Volume>> m_weights;
     std::vector<ref<Base>> m_nested_phases;
