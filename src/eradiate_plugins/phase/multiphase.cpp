@@ -7,20 +7,25 @@
 NAMESPACE_BEGIN(mitsuba)
 
 template <typename Float, typename Spectrum>
-class CumulativeBlendPhaseFunction final : public PhaseFunction<Float, Spectrum> {
+class MultiPhaseFunction final : public PhaseFunction<Float, Spectrum> {
 public:
     MI_IMPORT_BASE(PhaseFunction, m_flags, m_components)
     MI_IMPORT_TYPES(PhaseFunctionContext, Volume)
 
-    CumulativeBlendPhaseFunction(const Properties &props) : Base(props) {
+    MultiPhaseFunction(const Properties &props) : Base(props) {
 
         size_t phase_count = 0;
         
+        m_mis = false;
+
         for (auto &prop : props.objects()) {
             if (Base *phase = prop.try_get<Base>()) {
                 m_nested_phases.push_back(phase);
-                m_weights.push_back(props.get_volume<Volume>("weight_" + std::to_string(phase_count)));
+                m_weights.push_back(props.get_volume<Volume>("weight" + std::to_string(phase_count)));
                 phase_count++;
+            }
+            if (bool *mis = prop.try_get<bool>()) {
+                m_mis = *mis;
             }
         }
 
@@ -50,26 +55,41 @@ public:
         }
     }
 
+
+    void eval_MIS() {
+        if (false)  // TBD implement option in constructor
+            return;
+
+    }
+
     std::tuple<Vector3f, Spectrum, Float> sample(const PhaseFunctionContext &ctx,
                                                  const MediumInteraction3f &mi,
                                                  Float sample1, const Point2f &sample2,
                                                  Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::PhaseFunctionSample, active);
 
+        using std::get;
 
         std::vector<Float> weight_values(m_nested_phases.size());
-        std::vector<Float> cdf(m_nested_phases.size() + 1);
-        std::tuple<Vector3f, Spectrum, Float> result = { Vector3f(0.f), Spectrum(0.f), 0.f }, temp;
+        std::vector<Float> weight_index(m_nested_phases.size() + 1);
+        std::tuple<Vector3f, Spectrum, Float> result = { Vector3f(0.f), Spectrum(0.f), 0.f };
+        Vector3f wo_i;
+        Spectrum w_i;
+        Float pdf_i;
+        Spectrum val_j;
+        Float pdf_j;
         Mask M_i;
         Float weight_sum = 0.f, inv_weight_sum;
-        Float cdf_last, cdf_next;
-        Float sample1_adjusted = 0.f;
+        Float cdf_last = 0.f, cdf_next;
+        Float sample1_adjusted = 0.f;                
+        Spectrum phase_value_sum = 0.f;
+        Float pdf_mixture = 0.f;
 
-        cdf[0] = 0.f;
+        weight_index[0] = 0.f;
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
             weight_values[i] = eval_weight(mi, i, active);
             weight_sum += weight_values[i];
-            cdf[i + 1] = weight_sum;
+            weight_index[i + 1] = weight_sum;
         }
         inv_weight_sum = 1.f / weight_sum;
 
@@ -85,22 +105,43 @@ public:
             result = m_nested_phases[index]->sample(
                 ctx2, mi, sample1, sample2, active);
             const Float phase_weight = weight_values[index] * inv_weight_sum;
-            std::get<1>(result) *= phase_weight;
-            std::get<2>(result) *= phase_weight;
+            get<1>(result) *= phase_weight;
+            get<2>(result) *= phase_weight;
             return result;
         }
         
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
-            cdf_last = cdf[i]   * inv_weight_sum;
-            cdf_next = cdf[i+1] * inv_weight_sum;
+            cdf_next = weight_index[i+1] * inv_weight_sum;
             M_i = active && sample1 >= cdf_last && sample1 < cdf_next;
             if (dr::any_or<true>(M_i)) {
                 dr::masked(sample1_adjusted, M_i) = (sample1 - cdf_last) / (cdf_next - cdf_last);
-                temp = m_nested_phases[i]->sample(ctx, mi, sample1_adjusted, sample2, M_i);
-                dr::masked(std::get<0>(result), M_i) = std::get<0>(temp);
-                dr::masked(std::get<1>(result), M_i) = std::get<1>(temp);
-                dr::masked(std::get<2>(result), M_i) = std::get<2>(temp);
+                std::tie(wo_i, w_i, pdf_i) = m_nested_phases[i]->sample(ctx, mi, sample1_adjusted, sample2, M_i);
+                
+                if(unlikely(!m_mis)) {
+                    dr::masked(get<0>(result), M_i) = wo_i;
+                    dr::masked(get<1>(result), M_i) = w_i;
+                    dr::masked(get<2>(result), M_i) = pdf_i;
+                    continue;
+                }
+
+                for (size_t j = 0; j < m_nested_phases.size(); ++j) {
+                    std::tie(val_j, pdf_j) = m_nested_phases[j]->eval_pdf(ctx, mi, wo_i, M_i);
+                    
+                    phase_value_sum += weight_values[j] * val_j * inv_weight_sum;
+                    pdf_mixture     += weight_values[j] * pdf_j * inv_weight_sum;
+                }
+
+                Spectrum w_mis = dr::select(
+                    pdf_mixture > 1e-8f,
+                    phase_value_sum / pdf_mixture,
+                    Spectrum(0.f)
+                );
+
+                dr::masked(get<0>(result), M_i) = wo_i;
+                dr::masked(get<1>(result), M_i) = w_mis;
+                dr::masked(get<2>(result), M_i) = pdf_mixture;
             }
+            cdf_last = cdf_next;
         }
 
         return result;
@@ -117,6 +158,8 @@ public:
                                         const Vector3f &wo,
                                         Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::PhaseFunctionEvaluate, active);
+
+        using std::get;
 
         Float weight_sum = 0.f, inv_weight_sum;
         std::vector<Float> weight_values;
@@ -142,16 +185,16 @@ public:
                 ctx2, mi, wo, active);
             const Float phase_weight = weight_values[index] * inv_weight_sum;
 
-            std::get<0>(result) *= phase_weight;
-            std::get<1>(result) *= phase_weight;
+            get<0>(result) *= phase_weight;
+            get<1>(result) *= phase_weight;
             return result;
         }
 
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
             temp = m_nested_phases[i]->eval_pdf(ctx, mi, wo, active);
             const Float phase_weight = weight_values[i] * inv_weight_sum;
-            dr::masked(std::get<0>(result), active) += std::get<0>(temp) * phase_weight;
-            dr::masked(std::get<1>(result), active) += std::get<1>(temp) * phase_weight;
+            dr::masked(get<0>(result), active) += get<0>(temp) * phase_weight;
+            dr::masked(get<1>(result), active) += get<1>(temp) * phase_weight;
         }
 
         return result;
@@ -159,18 +202,19 @@ public:
 
     std::string to_string() const override {
         std::ostringstream oss;
-         oss << "CumulativeBlendPhaseFunction[" << std::endl
+         oss << "MultiPhaseFunction[" << std::endl
             << "  weights = " << string::indent(m_weights) << "," << std::endl
             << "]";
         return oss.str();
     }
 
-    MI_DECLARE_CLASS(CumulativeBlendPhaseFunction)
+    MI_DECLARE_CLASS(MultiPhaseFunction)
 protected:
     std::vector<ref<Volume>> m_weights;
     std::vector<ref<Base>> m_nested_phases;
     std::vector<uint32_t> m_nested_phases_index;
+    bool m_mis;
 };
 
-MI_EXPORT_PLUGIN(CumulativeBlendPhaseFunction)
+MI_EXPORT_PLUGIN(MultiPhaseFunction)
 NAMESPACE_END(mitsuba)
