@@ -231,7 +231,7 @@ public:
             weight_sum += weight_values.back();
         }
         
-        Float inv_weight_sum = dr::rcp(weight_sum);
+        Float inv_weight_sum = dr::select(weight_sum < dr::Epsilon<Float>, 1.0f, dr::rcp(weight_sum));
 
         if (unlikely(ctx.component != (uint32_t) -1)) {
             PhaseFunctionContext ctx2(ctx);
