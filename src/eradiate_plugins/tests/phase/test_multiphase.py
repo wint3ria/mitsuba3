@@ -8,10 +8,10 @@ def test01_create(variant_scalar_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": 0.2,
-            "phase1": {"type": "isotropic"},
-            "weight1": 0.8,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": 0.2,
+            "phase_1": {"type": "isotropic"},
+            "weight_1": 0.8,
         }
     )
     assert phase is not None
@@ -20,10 +20,10 @@ def test01_create(variant_scalar_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": 0.2,
-            "phase1": {"type": "hg"},
-            "weight1": 0.8,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": 0.2,
+            "phase_1": {"type": "hg"},
+            "weight_1": 0.8,
         }
     )
     assert phase is not None
@@ -42,10 +42,10 @@ def test02_eval_all(variant_scalar_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": weight,
-            "phase1": {"type": "hg", "g": g},
-            "weight1": 1 - weight,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": weight,
+            "phase_1": {"type": "hg", "g": g},
+            "weight_1": 1 - weight,
             "use_mis": False,
         }
     )
@@ -74,10 +74,10 @@ def test03_sample_all(variants_all_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": weight,
-            "phase1": {"type": "hg", "g": g},
-            "weight1": 1 - weight,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": weight,
+            "phase_1": {"type": "hg", "g": g},
+            "weight_1": 1 - weight,
             "use_mis": False,
         }
     )
@@ -113,10 +113,10 @@ def test04_eval_components(variant_scalar_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": weight,
-            "phase1": {"type": "hg", "g": g},
-            "weight1": 1 - weight,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": weight,
+            "phase_1": {"type": "hg", "g": g},
+            "weight_1": 1 - weight,
         }
     )
 
@@ -151,10 +151,10 @@ def test05_sample_components(variant_scalar_rgb):
     phase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": {"type": "isotropic"},
-            "weight0": weight,
-            "phase1": {"type": "hg", "g": g},
-            "weight1": 1 - weight,
+            "phase_0": {"type": "isotropic"},
+            "weight_0": weight,
+            "phase_1": {"type": "hg", "g": g},
+            "weight_1": 1 - weight,
         }
     )
 
@@ -222,9 +222,9 @@ def test06_sample_all_mis(variant_scalar_rgb, phases, weights, sample1, phase_id
     
     phase = mi.load_dict({
         "type": "multiphase",
-        "phase0": phase_objects[0], "weight0": weights[0],
-        "phase1": phase_objects[1], "weight1": weights[1],
-        "phase2": phase_objects[2], "weight2": weights[2],
+        "phase_0": phase_objects[0], "weight_0": weights[0],
+        "phase_1": phase_objects[1], "weight_1": weights[1],
+        "phase_2": phase_objects[2], "weight_2": weights[2],
     })
     
     wo, w, pdf = phase.sample(ctx, mei, sample1, [0.5, 0.5])
@@ -272,8 +272,8 @@ def test_compare_blendphase(variant_scalar_rgb):
     blendphase = mi.load_dict(
         {
             "type": "blendphase",
-            "phase0": phase0,
-            "phase1": phase1,
+            "phase_0": phase0,
+            "phase_1": phase1,
             "weight": weight,
         }
     )
@@ -281,10 +281,10 @@ def test_compare_blendphase(variant_scalar_rgb):
     multiphase = mi.load_dict(
         {
             "type": "multiphase",
-            "phase0": phase0,
-            "weight0": 1 - weight,
-            "phase1": phase1,
-            "weight1": weight,
+            "phase_0": phase0,
+            "weight_0": 1 - weight,
+            "phase_1": phase1,
+            "weight_1": weight,
             "use_mis": False,
         }
     )
@@ -317,10 +317,10 @@ def test08_chi2_isotropic_hg(variants_vec_backends_once_rgb):
 
     sample_func, pdf_func = PhaseFunctionAdapter("multiphase", {
         "type": "multiphase",
-        "phase0": {"type": "isotropic"},
-        "weight0": 0.8,
-        "phase1": {"type": "hg", "g": 0.2},
-        "weight1": 0.2,
+        "phase_0": {"type": "isotropic"},
+        "weight_0": 0.8,
+        "phase_1": {"type": "hg", "g": 0.2},
+        "weight_1": 0.2,
     })
 
     chi2 = ChiSquareTest(
@@ -339,10 +339,10 @@ def test09_chi2_hg_rayleigh(variants_vec_backends_once_rgb, use_mis):
 
     sample_func, pdf_func = PhaseFunctionAdapter("multiphase", {
         "type": "multiphase",
-        "phase0": {"type": "hg", "g": 0.2},
-        "weight0": 0.6,
-        "phase1": {"type": "rayleigh"},
-        "weight1": 0.4,
+        "phase_0": {"type": "hg", "g": 0.2},
+        "weight_0": 0.6,
+        "phase_1": {"type": "rayleigh"},
+        "weight_1": 0.4,
         "use_mis": use_mis,
     })
 

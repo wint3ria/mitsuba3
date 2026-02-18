@@ -17,6 +17,13 @@ strive to document breaking API changes in the release notes below.
   mechanism of the volume and implement periodic boundaries
   (PR [#32](https://github.com/eradiate/mitsuba3/pull/32)).
 
+### Bug fixes
+
+- **`multiphase` phase**: Guard the plugin from evaluating phase function
+  with a weight equal to zero at the interaction point. Handle the case where
+  all phase weights are zero at the interaction point. Use the blendphase
+  parameter format convention.
+
 ### Improvements
 
 - Improve the *DDIS* (Detector Directional Importance Sampling) variance
