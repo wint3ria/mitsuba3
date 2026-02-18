@@ -52,28 +52,28 @@ multiple populations of scattering elements.
         <phase type="multiphase">
             <boolean name="use_mis" value="true"/>
             
-            <phase name="phase0" type="isotropic"/>
-            <float name="weight0" value="1.0"/>
-            <phase name="phase1" type="hg">
+            <phase name="phase_0" type="isotropic"/>
+            <float name="weight_0" value="1.0"/>
+            <phase name="phase_1" type="hg">
                 <float name="g" value="0.5"/>
             </phase>
-            <float name="weight1" value="1.0"/>
-            <phase name="phase2" type="hg">
+            <float name="weight_1" value="1.0"/>
+            <phase name="phase_2" type="hg">
                 <float name="g" value="0.2"/>
             </phase>
-            <float name="weight2" value="1.0"/>
+            <float name="weight_2" value="1.0"/>
         </phase>
 
     .. code-tab:: python
 
         'type': 'multiphase',
         'use_mis': True,
-        'phase0': {'type': 'isotropic'},
-        'weight0': 1.0,
-        'phase1': {'type': 'hg', 'g': 0.5},
-        'weight1': 1.0,
-        'phase2': {'type': 'hg', 'g': 0.2},
-        'weight2': 1.0
+        'phase_0': {'type': 'isotropic'},
+        'weight_0': 1.0,
+        'phase_1': {'type': 'hg', 'g': 0.5},
+        'weight_1': 1.0,
+        'phase_2': {'type': 'hg', 'g': 0.2},
+        'weight_2': 1.0
 
 */
 
@@ -90,7 +90,7 @@ public:
         for (auto &prop : props.objects()) {
             if (Base *phase = prop.try_get<Base>()) {
                 m_nested_phases.push_back(phase);
-                m_weights.push_back(props.get_volume<Volume>("weight" + std::to_string(phase_count)));
+                m_weights.push_back(props.get_volume<Volume>("weight_" + std::to_string(phase_count)));
                 phase_count++;
             }
         }
@@ -115,8 +115,8 @@ public:
 
     void traverse(TraversalCallback *cb) override {
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
-            cb->put("phase" + std::to_string(i), m_nested_phases[i], ParamFlags::Differentiable);
-            cb->put("weight" + std::to_string(i), m_weights[i], ParamFlags::Differentiable);
+            cb->put("phase_" + std::to_string(i), m_nested_phases[i], ParamFlags::Differentiable);
+            cb->put("weight_" + std::to_string(i), m_weights[i], ParamFlags::Differentiable);
         }
     }
 
