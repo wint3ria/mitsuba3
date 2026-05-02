@@ -182,6 +182,10 @@ public:
                     
                     for (size_t j = 0; j < m_nested_phases.size(); ++j) {
                         if (j == i) continue;
+
+                        // Ensure phases with zero weights are not called at all
+                        Mask mask_j = mask_i && (weight_values[j] > dr::Epsilon<Float>);
+                        if (!dr::any_or<true>(mask_j)) continue;
                         
                         auto [val_j, pdf_j] = m_nested_phases[j]->eval_pdf(
                             ctx, mi, wo_i, mask_i
@@ -192,7 +196,7 @@ public:
                     }
                     
                     Spectrum w_mis = dr::select(
-                        pdf_mixture > 1e-8f,
+                        pdf_mixture > dr::Epsilon<Float>,
                         phase_value_sum / pdf_mixture,
                         Spectrum(0.f)
                     );
@@ -255,6 +259,11 @@ public:
         Float pdf = 0.f;
 
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
+
+            //Ensure zero weighted phases are never called
+            Mask mask_i = active && (weight_values[i] > dr::Epsilon<Float>);
+            if (!dr::any_or<true>(mask_i)) continue;
+            
             auto [val_i, pdf_i] = m_nested_phases[i]->eval_pdf(ctx, mi, wo, active);
             
             Float phase_weight = weight_values[i] * inv_weight_sum;
