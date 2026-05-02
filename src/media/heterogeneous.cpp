@@ -161,6 +161,13 @@ public:
         m_has_spectral_extinction = props.get<bool>("has_spectral_extinction", true);
 
         m_max_density = dr::opaque<Float>(m_scale * m_sigmat->max());
+
+        // Optional user-provided bbox override
+        if (props.has_property("aabb_min") && props.has_property("aabb_max")) {
+            ScalarPoint3f aabb_min = props.get<ScalarPoint3f>("aabb_min");
+            ScalarPoint3f aabb_max = props.get<ScalarPoint3f>("aabb_max");
+            m_aabb = ScalarBoundingBox3f(aabb_min, aabb_max);
+        }
     }
 
     void traverse(TraversalCallback *cb) override {
@@ -197,6 +204,9 @@ public:
 
     std::tuple<Mask, Float, Float>
     intersect_aabb(const Ray3f &ray) const override {
+        if (m_aabb.valid()) {
+            return m_aabb.ray_intersect(ray);
+        }
         return m_sigmat->bbox().ray_intersect(ray);
     }
 
@@ -215,6 +225,7 @@ private:
     ref<Volume> m_sigmat, m_albedo;
     ScalarFloat m_scale;
     Float m_max_density;
+    ScalarBoundingBox3f m_aabb;
 
     MI_TRAVERSE_CB(Base, m_sigmat, m_albedo, m_max_density)
 };
