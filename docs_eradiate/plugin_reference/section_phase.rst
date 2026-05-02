@@ -14,3 +14,6 @@ radiative transfer:
   matrix form) for polarized light transport through anisotropic media.
 - ``multiphase`` — linearly combines multiple phase functions, enabling
   composite media (*e.g.* a mixture of molecular and aerosol scattering).
+- ``particlefieldphase`` — polarized phase function tabulated on a grid of
+  effective radius and effective variance, read from two spatial fields at
+  the interaction point.

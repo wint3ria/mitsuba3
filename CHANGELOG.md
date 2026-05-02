@@ -16,6 +16,11 @@ strive to document breaking API changes in the release notes below.
   the underlying `sigma_t` volume bbox. In turns allows to exploit the wrap
   mechanism of the volume and implement periodic boundaries
   (PR [#32](https://github.com/eradiate/mitsuba3/pull/32)).
+- **`particlefieldphase` phase function**: A polarized phase function
+  tabulated on a grid of effective radius and effective variance, each grid
+  entry carrying its own irregular `cos(theta)` discretization. The 4
+  cornering entries at a query point are bilinearly blended using one
+  of 3 proposed methods (PR [#35](https://github.com/eradiate/mitsuba3/pull/35)).
 
 ### Improvements
 

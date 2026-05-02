@@ -1,0 +1,797 @@
+import time
+
+import pytest
+from pytest import fixture
+import drjit as dr
+import mitsuba as mi
+import numpy as np
+
+#################################
+# Helper construction functions #
+#################################
+
+BLENDING_METHODS = ["search", "stochastic", "tabulate"]
+SCALAR_AND_LLVM_VARIANTS = ["scalar_mono_polarized", "llvm_ad_rgb"]
+
+
+def blending_methods():
+    """List of blending methods supported by the active variant"""
+    methods = list(BLENDING_METHODS)
+    if mi.variant() not in {v for v in mi.variants() if v.startswith("scalar")}:
+        methods.remove("tabulate")
+    return methods
+
+
+def storage_types():
+    """Return the (array, array_u) dynamic-buffer types for the active variant"""
+    variant = mi.variant()
+    if variant.startswith("scalar"):
+        array = dr.scalar.ArrayXf64 if "double" in variant else dr.scalar.ArrayXf
+        return array, dr.scalar.ArrayXu
+    return mi.Float, mi.UInt32
+
+
+def make_phase_grid(rng, n_r=10, n_v=10, min_pts=50, max_pts=200,
+                    array=None, array_u=None):
+    """Generate a random set of nodes and populate the phase with Henyey-Greenstein phase functions"""
+
+    if array is None or array_u is None:
+        default_array, default_array_u = storage_types()
+        array = array if array is not None else default_array
+        array_u = array_u if array_u is not None else default_array_u
+
+    n_entries = n_r * n_v
+    grid_len   = rng.integers(min_pts, max_pts, n_entries).astype(np.uint32)
+    grid_start = np.concatenate([[0], np.cumsum(grid_len[:-1])]).astype(np.uint32)
+    total_pts  = int(grid_len.sum())
+
+    nodes         = np.empty(total_pts)
+    phase_mueller = np.empty((total_pts, 6))
+
+    for i in range(n_entries):
+        s, l = int(grid_start[i]), int(grid_len[i])
+        cos_vals = np.sort(rng.uniform(-1.0, 1.0, l))
+        cos_vals[0], cos_vals[-1] = -1.0, 1.0
+        # De-duplicate at float32 precision: single-precision variants store
+        # nodes as float32 (see storage_types()), and with ~1000 points
+        # continuously sampled into float32's coarser grid, two draws
+        # rounding to the same value is a possibility.
+        cos_vals = cos_vals.astype(np.float32)
+        for k in range(1, l):
+            if cos_vals[k] <= cos_vals[k - 1]:
+                cos_vals[k] = np.nextafter(cos_vals[k - 1], np.float32(1.0))
+        nodes[s : s + l] = cos_vals
+
+        g  = rng.uniform(-0.9, 0.9)
+        g2 = g * g
+        denom = (1.0 + g2 - 2.0 * g * cos_vals) ** 1.5
+        m11 = (1.0 - g2) / denom / (4.0 * np.pi)
+        phase_mueller[s : s + l, 0] = m11
+        phase_mueller[s : s + l, 1] = m11 * 0.1
+        phase_mueller[s : s + l, 2] = m11 * 0.9
+        phase_mueller[s : s + l, 3] = m11 * 0.8
+        phase_mueller[s : s + l, 4] = m11 * 0.05
+        phase_mueller[s : s + l, 5] = m11 * 0.8
+
+    return (
+        array(nodes),
+        array_u(grid_start),
+        array_u(grid_len),
+        array(phase_mueller.flatten()),
+    )
+
+
+def make_rv_volumes(rng, r_eff_bounds, v_eff_bounds, shape=(1, 1, 1)):
+    """Build random spatial gridvolumes of r_eff and v_eff within the provided bounds"""
+
+    if r_eff_bounds[0] == r_eff_bounds[1]:
+        r_eff_val = np.full(shape, r_eff_bounds[0])
+    else:
+        r_eff_val = r_eff_bounds[0] + rng.random(shape) * (r_eff_bounds[1] - r_eff_bounds[0])
+    if v_eff_bounds[0] == v_eff_bounds[1]:
+        v_eff_val = np.full(shape, v_eff_bounds[0])
+    else:
+        v_eff_val = v_eff_bounds[0] + rng.random(shape) * (v_eff_bounds[1] - v_eff_bounds[0])
+
+    return (
+        { "type": "gridvolume", "grid": mi.VolumeGrid(r_eff_val), "filter_type": "nearest" },
+        { "type": "gridvolume", "grid": mi.VolumeGrid(v_eff_val), "filter_type": "nearest" },
+    )
+
+
+def make_rv_grid(n_r=22, n_v=3, r_bounds=(4.0, 25.0), v_bounds=(0.1, 0.2), sigma_s_weight=None):
+    """Build a regular grid of r_eff and v_eff points"""
+
+    r_eff_grid = np.linspace(r_bounds[0], r_bounds[1], n_r)
+    v_eff_grid = np.linspace(v_bounds[0], v_bounds[1], n_v)
+
+    if sigma_s_weight is None:
+        sigma_s_weight = np.ones(n_r * n_v)
+    sigma_s_weight = np.asarray(sigma_s_weight)
+
+    return (
+        mi.VolumeGrid(r_eff_grid.reshape(1, 1, -1, 1)),
+        mi.VolumeGrid(v_eff_grid.reshape(1, 1, -1, 1)),
+        mi.VolumeGrid(sigma_s_weight.reshape(1, 1, -1, 1)),
+    )
+
+
+def make_interaction(wi=(0, 0, 1), p=(0.5, 0.5, 0.5)):
+    """Build a medium interaction with the given incoming direction and position"""
+    mei         = mi.MediumInteraction3f()
+    mei.wi      = mi.Vector3f(wi)
+    mei.p       = mi.Point3f(p)
+    mei.sh_frame = mi.Frame3f(mei.wi)
+    return mei
+
+
+def make_query_interactions(rng, n_points, r_bounds, v_bounds, wi=(0, 0, 1)):
+    """Build a batch of interactions and their matching (r_eff, v_eff) volumes"""
+    rv_volumes = make_rv_volumes(rng, r_bounds, v_bounds, shape=(1, 1, n_points))
+    meis = [
+        make_interaction(wi=wi, p=(float(rng.random()), 0.5, 0.5))
+        for _ in range(n_points)
+    ]
+    return rv_volumes, meis
+
+
+def make_phase(
+        r_eff_volume, v_eff_volume,
+        r_eff_grid,   v_eff_grid,
+        nodes, phase_mueller,
+        grid_start, grid_len,
+        blending_method,
+        sigma_s_weight,
+    ):
+    """Build a complete phase dictionary"""
+
+    phase = mi.load_dict({
+        "type": "particlefieldphase",
+        "r_eff_volume": r_eff_volume,
+        "v_eff_volume": v_eff_volume,
+        "r_eff_grid": r_eff_grid,
+        "v_eff_grid": v_eff_grid,
+        "nodes": nodes,
+        "phase_mueller": phase_mueller,
+        "grid_start": grid_start,
+        "grid_len": grid_len,
+        "blending_method": blending_method,
+        "sigma_s_weight": sigma_s_weight,
+    })
+    return phase
+
+
+def build_grid(rng, n_r, n_v, r_bounds=(10.0, 11.0), v_bounds=(0.1, 0.2), sigma_s_weight=None,
+               min_pts=10, max_pts=11):
+    """Build grid parameters (nodes, mueller matrix, and r_eff/v_eff grids)"""
+
+    nodes, grid_start, grid_len, phase_mueller = make_phase_grid(rng, n_r=n_r, n_v=n_v, min_pts=min_pts, max_pts=max_pts)
+    r_eff_grid, v_eff_grid, sigma_s_weight = make_rv_grid(
+        n_r=n_r, n_v=n_v, r_bounds=r_bounds, v_bounds=v_bounds, sigma_s_weight=sigma_s_weight)
+    return nodes, grid_start, grid_len, phase_mueller, r_eff_grid, v_eff_grid, sigma_s_weight
+
+
+def build_phase_function(grid, rv_volumes, blending_method):
+    """Construct a phase function from grid parameters"""
+
+    nodes, grid_start, grid_len, phase_mueller, r_eff_grid, v_eff_grid, sigma_s_weight = grid
+    r_eff, v_eff = rv_volumes
+
+    phase = make_phase(
+        r_eff, v_eff, r_eff_grid, v_eff_grid,
+        nodes, phase_mueller,
+        grid_start, grid_len,
+        blending_method,
+        sigma_s_weight,
+    )
+
+    return phase, r_eff, v_eff, r_eff_grid, v_eff_grid, nodes, phase_mueller, grid_start, grid_len, sigma_s_weight
+
+
+def bilinear_corners(r_eff_volume, v_eff_volume, r_eff_grid, v_eff_grid, sigma_s_weight, mei):
+    """Calculate bilinear interpolation weights rescaled by sigma_s from an interaction and r_eff, v_eff volumes"""
+
+    r_eff_grid_np     = np.array(r_eff_grid).ravel()
+    v_eff_grid_np     = np.array(v_eff_grid).ravel()
+    sigma_s_weight_np = np.array(sigma_s_weight).ravel()
+
+    n_r = len(r_eff_grid_np)
+    n_v = len(v_eff_grid_np)
+
+    r_eff = float(dr.slice(mi.load_dict(r_eff_volume).eval_1(mei), 0))
+    v_eff = float(dr.slice(mi.load_dict(v_eff_volume).eval_1(mei), 0))
+
+    if n_r > 1:
+        ir = int(np.clip(np.searchsorted(r_eff_grid_np, r_eff, side="right") - 1, 0, n_r - 2))
+        tr = (r_eff - r_eff_grid_np[ir]) / (r_eff_grid_np[ir + 1] - r_eff_grid_np[ir])
+    else:
+        ir, tr = 0, 0.0
+
+    if n_v > 1:
+        iv = int(np.clip(np.searchsorted(v_eff_grid_np, v_eff, side="right") - 1, 0, n_v - 2))
+        tv = (v_eff - v_eff_grid_np[iv]) / (v_eff_grid_np[iv + 1] - v_eff_grid_np[iv])
+    else:
+        iv, tv = 0, 0.0
+
+    ir_hi = ir + 1 if n_r > 1 else ir
+    iv_hi = iv + 1 if n_v > 1 else iv
+
+    idx = np.array([
+        ir    * n_v + iv,
+        ir    * n_v + iv_hi,
+        ir_hi * n_v + iv,
+        ir_hi * n_v + iv_hi,
+    ])
+    w = np.array([
+        (1.0 - tr) * (1.0 - tv),
+        (1.0 - tr) * tv,
+        tr * (1.0 - tv),
+        tr * tv,
+    ]) * sigma_s_weight_np[idx]
+    w_sum = w.sum()
+    if w_sum > 0:
+        w = w / w_sum
+
+    return idx, w
+
+
+def entry_cdf(grid_start_np, grid_len_np, nodes_np, phase_mueller_np, e):
+    """Calculate the CDF of a single entry"""
+
+    s, l = int(grid_start_np[e]), int(grid_len_np[e])
+    entry_nodes = nodes_np[s : s + l]
+    m11 = phase_mueller_np[s : s + l, 0]
+    increments = 0.5 * (m11[:-1] + m11[1:]) * np.diff(entry_nodes)
+    cdf = np.concatenate(([0.0], np.cumsum(increments)))
+    total = cdf[-1]
+    if total > 0:
+        cdf = cdf / total
+    return cdf, total
+
+
+def union_grid(idx, w, grid_start_np, grid_len_np, nodes_np, lo_bound, hi_bound):
+    """Merge two cosine discretizations using a simple union"""
+
+    merged = [lo_bound, hi_bound]
+    for e, wgt in zip(idx, w):
+        if wgt == 0.0:
+            continue
+        e = int(e)
+        s, l = int(grid_start_np[e]), int(grid_len_np[e])
+        entry_nodes = nodes_np[s : s + l]
+        mask = (entry_nodes >= lo_bound) & (entry_nodes <= hi_bound)
+        merged.extend(entry_nodes[mask].tolist())
+    return np.unique(np.array(merged))
+
+
+def mock_phase(
+        r_eff_volume, v_eff_volume,
+        r_eff_grid,   v_eff_grid,
+        nodes, phase_mueller,
+        grid_start, grid_len,
+        sigma_s_weight,
+        mei,
+    ):
+    """Build a reference phase function via tabphase_polarized, reproducing the blended "tabulate" result at the interaction point"""
+
+    nodes_np         = np.array(nodes)
+    grid_start_np    = np.array(grid_start)
+    grid_len_np      = np.array(grid_len)
+    phase_mueller_np = np.array(phase_mueller).reshape(-1, 6)
+
+    idx, w = bilinear_corners(
+        r_eff_volume, v_eff_volume, r_eff_grid, v_eff_grid, sigma_s_weight, mei)
+
+    lo_bound = max(nodes_np[int(grid_start_np[int(e)])] for e in idx)
+    hi_bound = min(nodes_np[int(grid_start_np[int(e)]) + int(grid_len_np[int(e)]) - 1] for e in idx)
+
+    grid = union_grid(idx, w, grid_start_np, grid_len_np, nodes_np, lo_bound, hi_bound)
+
+    columns = np.zeros((6, len(grid)))
+    for e, wgt in zip(idx, w):
+        if wgt == 0.0:
+            continue
+        e = int(e)
+        s, l = int(grid_start_np[e]), int(grid_len_np[e])
+        entry_nodes = nodes_np[s : s + l]
+        _, total = entry_cdf(grid_start_np, grid_len_np, nodes_np, phase_mueller_np, e)
+        norm = 1.0 / total if total > 0 else 0.0
+        for c in range(6):
+            columns[c] += wgt * norm * np.interp(grid, entry_nodes, phase_mueller_np[s : s + l, c])
+
+    fmt = lambda v: ",".join(repr(float(x)) for x in v)
+
+    return mi.load_dict({
+        "type": "tabphase_polarized",
+        "nodes": fmt(grid),
+        "m11": fmt(columns[0]),
+        "m12": fmt(columns[1]),
+        "m22": fmt(columns[2]),
+        "m33": fmt(columns[3]),
+        "m34": fmt(columns[4]),
+        "m44": fmt(columns[5]),
+    })
+
+
+def eval_and_sample(rng, phase, mei):
+    """Sample and evaluate the phase function at the same interaction, for pdf-consistency checks"""
+
+    ctx = mi.PhaseFunctionContext(None)
+
+    sample1 = float(rng.random())
+    sample2 = mi.Point2f(float(rng.random()), float(rng.random()))
+
+    wo, weight, pdf_sample = phase.sample(ctx, mei, sample1, sample2)
+    val, pdf_eval = phase.eval_pdf(ctx, mei, wo)
+
+    return wo, weight, pdf_sample, val, pdf_eval
+
+
+def check_phase_consistency(
+        rng,
+        phase,
+        r_eff, v_eff, r_eff_grid, v_eff_grid,
+        nodes, phase_mueller, grid_start, grid_len,
+        sigma_s_weight,
+        mei,
+    ):
+    """Check sample/eval self-consistency and agreement with the mock_phase reference"""
+
+    wo, weight, pdf_sample, val, pdf_eval = eval_and_sample(rng, phase, mei)
+
+    assert np.isclose(float(dr.slice(pdf_sample, 0)), float(dr.slice(pdf_eval, 0)))
+
+    mock = mock_phase(
+        r_eff, v_eff, r_eff_grid, v_eff_grid,
+        nodes, phase_mueller, grid_start, grid_len, sigma_s_weight, mei)
+    ctx = mi.PhaseFunctionContext(None)
+    val_mock, pdf_mock = mock.eval_pdf(ctx, mei, wo)
+
+    assert np.isclose(float(dr.slice(pdf_eval, 0)), float(dr.slice(pdf_mock, 0)), rtol=1e-4)
+    assert np.allclose(np.array(val), np.array(val_mock), rtol=1e-3, atol=1e-6)
+
+
+def cell_query_points(r_nodes, v_nodes):
+    """Create test evaluation points at the r_eff/v_eff volumes cell centers"""
+
+    points = []
+    for i in range(len(r_nodes) - 1):
+        r_lo, r_hi = r_nodes[i], r_nodes[i + 1]
+        r_mid = 0.5 * (r_lo + r_hi)
+        for j in range(len(v_nodes) - 1):
+            v_lo, v_hi = v_nodes[j], v_nodes[j + 1]
+            v_mid = 0.5 * (v_lo + v_hi)
+            points.append((r_mid, v_mid))
+            points.append((r_lo, v_mid))
+            points.append((r_mid, v_lo))
+    return points
+
+
+def reference_eval_envelope(query_nodes, grid_start_np, grid_len_np, phase_mueller_np, nodes_np, n_entries):
+    """Reference implementation of accumulate_envelope: per-node max of the normalized phase value across all entries"""
+
+    values = np.zeros(len(query_nodes))
+    for e in range(n_entries):
+        s, l = int(grid_start_np[e]), int(grid_len_np[e])
+        entry_nodes = nodes_np[s : s + l]
+        _, total = entry_cdf(grid_start_np, grid_len_np, nodes_np, phase_mueller_np, e)
+        norm = 1.0 / total if total > 0 else 0.0
+        m11 = np.interp(query_nodes, entry_nodes, phase_mueller_np[s : s + l, 0])
+        values = np.maximum(values, m11 * norm / (2.0 * np.pi))
+    return values
+
+
+############################
+# Parametrization fixtures #
+############################
+
+
+@fixture(params=SCALAR_AND_LLVM_VARIANTS)
+def variants_scalar_or_llvm(request):
+    """Enable one representative scalar variant and one LLVM variant, with conftest's usual per-test cleanup"""
+    return request.getfixturevalue(f"variant_{request.param}")
+
+
+@fixture(params=BLENDING_METHODS)
+def blending_method(request, variants_scalar_or_llvm):
+    """One blending method, skipped for combinations the active variant doesn't support"""
+    if request.param not in blending_methods():
+        pytest.skip("tabulate is scalar-only")
+    return request.param
+
+
+@fixture
+def grid_single(variants_scalar_or_llvm, np_rng):
+    """Simple single-entry (n_r=n_v=1) grid, 10 node points"""
+    return build_grid(np_rng, 1, 1)
+
+
+@fixture
+def rv_volumes_single(np_rng):
+    """Simple constant r_eff v_eff volumes"""
+    return make_rv_volumes(np_rng, (10.0, 10.0), (0.1, 0.1))
+
+
+@fixture
+def interaction_centrenadir():
+    """Basic interaction"""
+    return make_interaction(wi=(0, 0, 1), p=(0.5, 0.5, 0.5))
+
+
+@fixture(params=[
+        (0, 0, 1),
+        (0, 0, -1),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (1, 1, 1),
+        (0.27, -0.64, 0.53),
+    ], ids=["nadir", "zenith", "+x", "-x", "+y", "-y", "oblique", "generic"])
+def interaction_directions(request):
+    """Create several interactions with different directions"""
+    wi = np.array(request.param, dtype=float)
+    wi = wi / np.linalg.norm(wi)
+    return make_interaction(wi=wi, p=(0.5, 0.5, 0.5))
+
+
+@fixture
+def phase_function_single(blending_method, grid_single, rv_volumes_single):
+    """Basic particlefieldphase function using constant r_eff, v_eff properties"""
+    return build_phase_function(grid_single, rv_volumes_single, blending_method)
+
+
+@fixture(params=[(2, 1), (1, 2), (2, 2)], ids=["2x1", "1x2", "2x2"])
+def grid_dual(request, variants_scalar_or_llvm, np_rng):
+    """Build 1 dim and 2 dim interpolation grid parameters"""
+    n_r, n_v = request.param
+    return build_grid(np_rng, n_r, n_v)
+
+
+@fixture(params=[(10.0, 0.1), (10.5, 0.15), (11.0, 0.2)], ids=["low", "mid", "high"])
+def rv_volumes_dual(request, np_rng):
+    """Make several spatial volumes of constant (r_eff, v_eff) values"""
+    r_eff_val, v_eff_val = request.param
+    return make_rv_volumes(np_rng, (r_eff_val, r_eff_val), (v_eff_val, v_eff_val))
+
+
+@fixture
+def phase_function_dual(blending_method, grid_dual, rv_volumes_dual):
+    """Build phase functions of 1 to 2 dim interpolation grid parameters"""
+    return build_phase_function(grid_dual, rv_volumes_dual, blending_method)
+
+
+@fixture(params=[
+        [1.0,    1.0, 1.0, 1.0],
+        [1000.0, 1.0, 1.0, 1.0],
+        [1.0,    1.0, 1.0, 1000.0],
+        [1e-6,   1.0, 1.0, 1.0],
+    ], ids=["uniform", "corner0_dominant", "corner3_dominant", "corner0_suppressed"])
+def grid_sigma_s(request, variants_scalar_or_llvm, np_rng):
+    """Build sigma_s weights for a 2x2 interpolation grid of (r_eff, v_eff)"""
+    return build_grid(np_rng, 2, 2, sigma_s_weight=request.param)
+
+
+@fixture
+def phase_function_sigma_s(blending_method, grid_sigma_s, np_rng):
+    """Build different phase functions with varying sigma_s weights"""
+    rv_volumes = make_rv_volumes(np_rng, (10.5, 10.5), (0.15, 0.15))
+    return build_phase_function(grid_sigma_s, rv_volumes, blending_method)
+
+
+@fixture(params=[
+        (100.0, 0.15, "out of dataset range"),
+        (10.5, 100.0,  "out of dataset range"),
+        (float("nan"), 0.15, "NaN"),
+    ], ids=["r_eff_out_of_range", "v_eff_out_of_range", "nan_r_eff"])
+def phase_invalid_query(request, variant_scalar_mono_polarized, np_rng):
+    """Purposefully build an invalid spatial r_eff or v_eff volume"""
+    r_eff_val, v_eff_val, match = request.param
+    grid = build_grid(np_rng, 2, 2)
+    rv_volumes = make_rv_volumes(np_rng, (r_eff_val, r_eff_val), (v_eff_val, v_eff_val))
+    phase, *_ = build_phase_function(grid, rv_volumes, "search")
+    return phase, match
+
+
+#########
+# Tests #
+#########
+
+
+def test_instantiate(phase_function_single):
+    """Check that a single-entry phase function loads successfully"""
+    phase, *_ = phase_function_single
+    assert phase is not None
+
+
+def test_single_directions(phase_function_single, interaction_directions, np_rng):
+    """Check sample/eval self-consistency of a single-entry phase function across several incoming directions"""
+    check_phase_consistency(np_rng, *phase_function_single, interaction_directions)
+
+
+def test_dual_directions(phase_function_dual, interaction_directions, np_rng):
+    """Check sample/eval self-consistency across 1 and 2 dim (r_eff, v_eff) interpolation grids"""
+    check_phase_consistency(np_rng, *phase_function_dual, interaction_directions)
+
+
+def test_sigma_s_weight(phase_function_sigma_s, interaction_centrenadir, np_rng):
+    """Check sample/eval self-consistency under varying per-corner sigma_s weights"""
+    check_phase_consistency(np_rng, *phase_function_sigma_s, interaction_centrenadir)
+
+
+def test_invalid_query_raises(phase_invalid_query, interaction_centrenadir):
+    """Check that out-of-range or NaN (r_eff, v_eff) queries raise instead of returning silently wrong values"""
+    phase, match = phase_invalid_query
+    ctx = mi.PhaseFunctionContext(None)
+    with pytest.raises(Exception, match=match):
+        phase.eval_pdf(ctx, interaction_centrenadir, mi.Vector3f([0, 0, -1]))
+
+
+def _check_sample_distribution(cos_theta, n_query):
+    """search/stochastic/tabulate cross-check used by test_sample_distribution"""
+
+    failures = []
+    ref = cos_theta["search"]
+
+    if "tabulate" in cos_theta:
+        tab = cos_theta["tabulate"]
+        n = tab.shape[1]
+        close = np.isclose(tab, ref[:, :n], atol=1e-4, rtol=1e-4)
+        n_bad = int((~close).sum())
+        print(f"tabulate: {int(close.sum())}/{close.size} samples matched search "
+              f"to numerical precision ({n_bad} mismatches)")
+
+        if n_bad:
+            q_idx, k_idx = np.unravel_index(np.flatnonzero(~close)[:5], close.shape)
+            failures.append(
+                f"tabulate: {n_bad}/{close.size} samples disagreed with search "
+                f"beyond numerical precision; first mismatches at (query,sample)="
+                f"{list(zip(q_idx.tolist(), k_idx.tolist()))[0]}"
+            )
+
+    if "stochastic" in cos_theta:
+        stoch = cos_theta["stochastic"]
+        cur_mean, cur_std = stoch.mean(axis=1), stoch.std(axis=1)
+        ref_mean, ref_std = ref.mean(axis=1), ref.std(axis=1)
+
+        good = np.isclose(cur_mean, ref_mean, atol=0.05) & np.isclose(cur_std, ref_std, rtol=0.05)
+        bad = ~good
+        print(f"stochastic: {int(good.sum())}/{n_query} interactions matched search in "
+              f"distribution (up to 10 first bad query indices: {np.flatnonzero(bad).tolist()[:10]})")
+
+        if bad.any():
+            failures.append(
+                f"stochastic: {int(bad.sum())}/{n_query} interactions mismatched vs search"
+            )
+
+    assert not failures, "\n".join(failures)
+
+
+def _sample_distribution_grid(rng):
+    """Grid and query points used by test_sample_distribution"""
+    r_bounds, v_bounds = (4.0, 25.0), (0.1, 0.2)
+    grid = build_grid(rng, 22, 2, r_bounds=r_bounds, v_bounds=v_bounds, min_pts=700, max_pts=1000)
+    n_query = 100
+    rv_volumes, meis = make_query_interactions(rng, n_query, r_bounds, v_bounds)
+    return grid, rv_volumes, meis, n_query
+
+
+def _print_sample_timing(method, n_total, elapsed):
+    """Print the per-method sampling throughput for test_sample_distribution"""
+    print(f"{method}: {n_total} samples in {elapsed*1e3:.2f} ms "
+          f"({elapsed/n_total*1e6:.2f} us/sample)")
+
+
+def _sample_cos_theta_scalar(phase, ctx, meis, n_samples, u_all, phi_all, s1_all):
+    """Sample cos_theta one element at a time (scalar variant)"""
+    arr = np.empty((len(meis), n_samples))
+    for q, mei in enumerate(meis):
+        for k in range(n_samples):
+            s1 = float(s1_all[q, k])
+            s2 = mi.Point2f(float(u_all[q, k]), float(phi_all[q, k]))
+            wo, weight, pdf = phase.sample(ctx, mei, s1, s2)
+            arr[q, k] = float(dr.slice(-dr.dot(wo, mei.wi), 0))
+    return arr
+
+
+def _sample_cos_theta_llvm(phase, ctx, mei_batched, n_query, n_samples, u_all, phi_all, s1_all):
+    """Sample cos_theta in batched calls (LLVM variant)"""
+    wo, weight, pdf = phase.sample(
+        ctx, mei_batched,
+        mi.Float(s1_all.reshape(-1)),
+        mi.Point2f(u_all.reshape(-1), phi_all.reshape(-1)),
+    )
+    return np.array(-dr.dot(wo, mei_batched.wi)).reshape(n_query, n_samples)
+
+
+def _batch_interactions(meis, n_samples_per_query):
+    """Tile each query's interaction across its samples (LLVM variant)"""
+    n = len(meis) * n_samples_per_query
+    px = np.repeat([float(dr.slice(mei.p.x, 0)) for mei in meis], n_samples_per_query)
+    py = np.repeat([float(dr.slice(mei.p.y, 0)) for mei in meis], n_samples_per_query)
+    pz = np.repeat([float(dr.slice(mei.p.z, 0)) for mei in meis], n_samples_per_query)
+    wi0 = meis[0].wi
+
+    mei_batched = mi.MediumInteraction3f()
+    mei_batched.wi = mi.Vector3f(
+        [float(dr.slice(wi0.x, 0))] * n,
+        [float(dr.slice(wi0.y, 0))] * n,
+        [float(dr.slice(wi0.z, 0))] * n,
+    )
+    mei_batched.p = mi.Point3f(px, py, pz)
+    mei_batched.sh_frame = mi.Frame3f(mei_batched.wi)
+    return mei_batched
+
+
+def test_sample_distribution(variants_scalar_or_llvm, np_rng):
+    """Check search/tabulate exact agreement and stochastic/search distribution agreement"""
+    rng_local = np.random.default_rng(42)
+
+    grid, rv_volumes, meis, n_query = _sample_distribution_grid(np_rng)
+    ctx = mi.PhaseFunctionContext(None)
+
+    n_samples_per_query = 4000
+    n_samples_tabulate = 100
+
+    u_all = rng_local.random((n_query, n_samples_per_query))
+    phi_all = rng_local.random((n_query, n_samples_per_query))
+    s1_all = rng_local.random((n_query, n_samples_per_query))
+
+    is_scalar = variants_scalar_or_llvm.startswith("scalar")
+    mei_batched = _batch_interactions(meis, n_samples_per_query) if not is_scalar else None
+
+    cos_theta = {}
+    for method in blending_methods():
+        phase, *_ = build_phase_function(grid, rv_volumes, method)
+        n_samples = n_samples_tabulate if method == "tabulate" else n_samples_per_query
+
+        t0 = time.perf_counter()
+        if is_scalar:
+            cos_theta[method] = _sample_cos_theta_scalar(
+                phase, ctx, meis, n_samples, u_all, phi_all, s1_all)
+        else:
+            cos_theta[method] = _sample_cos_theta_llvm(
+                phase, ctx, mei_batched, n_query, n_samples, u_all, phi_all, s1_all)
+        _print_sample_timing(method, n_query * n_samples, time.perf_counter() - t0)
+
+    _check_sample_distribution(cos_theta, n_query)
+
+
+@pytest.mark.parametrize("n_r,n_v", [
+    (n_r, n_v) for n_r in range(10, 60, 10) for n_v in range(10, 60, 10)
+])
+def test_grid_sizes(n_r, n_v, blending_method, np_rng):
+    """Check finite, positive pdf across a set of (r_eff, v_eff) grid shapes"""
+    grid = build_grid(np_rng, n_r, n_v)
+    *_, r_eff_grid, v_eff_grid, _ = grid
+
+    r_eff_grid_np = np.array(r_eff_grid).ravel()
+    v_eff_grid_np = np.array(v_eff_grid).ravel()
+    r_eff_val = float(r_eff_grid_np[len(r_eff_grid_np) // 2])
+    v_eff_val = float(v_eff_grid_np[len(v_eff_grid_np) // 2])
+
+    rv_volumes = make_rv_volumes(np_rng, (r_eff_val, r_eff_val), (v_eff_val, v_eff_val))
+    mei = make_interaction(wi=(0, 0, 1))
+    ctx = mi.PhaseFunctionContext(None)
+
+    phase, *_ = build_phase_function(grid, rv_volumes, blending_method)
+    val, pdf = phase.eval_pdf(ctx, mei, mi.Vector3f([0, 0, -1]))
+    pdf = float(dr.slice(pdf, 0))
+    assert np.isfinite(pdf)
+    assert pdf > 0.0
+
+
+@pytest.mark.parametrize("blending_method", BLENDING_METHODS)
+def test_large_grid_sweep(blending_method, variant_scalar_mono_polarized, interaction_directions, np_rng):
+    """Check sample/eval self-consistency at many query points scattered across a 4x4 grid's cells"""
+    grid = build_grid(np_rng, 4, 4, r_bounds=(10.0, 14.0), v_bounds=(0.1, 0.2))
+    *_, r_eff_grid, v_eff_grid, _ = grid
+
+    r_eff_grid_np = np.array(r_eff_grid).ravel()
+    v_eff_grid_np = np.array(v_eff_grid).ravel()
+    query_points = cell_query_points(r_eff_grid_np, v_eff_grid_np)
+
+    for r_val, v_val in query_points:
+        rv_volumes = make_rv_volumes(np_rng, (r_val, r_val), (v_val, v_val))
+        phase_bundle = build_phase_function(grid, rv_volumes, blending_method)
+        check_phase_consistency(np_rng, *phase_bundle, interaction_directions)
+
+
+def test_get_envl_and_eval_envl(variants_scalar_or_llvm, np_rng):
+    """Check get_envelope_nodes/accumulate_envelope against a reference per-node max of the normalized phase value"""
+    n_r, n_v = 3, 3
+    grid = build_grid(np_rng, n_r, n_v)
+    nodes, grid_start, grid_len, phase_mueller, *_ = grid
+    rv_volumes = make_rv_volumes(np_rng, (10.5, 10.5), (0.15, 0.15))
+    phase, *_ = build_phase_function(grid, rv_volumes, "search")
+
+    nodes_np         = np.array(nodes)
+    grid_start_np    = np.array(grid_start)
+    grid_len_np      = np.array(grid_len)
+    phase_mueller_np = np.array(phase_mueller).reshape(-1, 6)
+
+    nds = phase.get_envelope_nodes()
+    nds_np = np.array(nds)
+    assert np.allclose(nds_np, np.unique(nodes_np))
+
+    array, _ = storage_types()
+    values = array(np.zeros(len(nds_np)))
+    phase.accumulate_envelope(nds, values)
+
+    ref_values = reference_eval_envelope(nds_np, grid_start_np, grid_len_np, phase_mueller_np, nodes_np, n_r * n_v)
+
+    assert np.allclose(np.array(values), ref_values, rtol=1e-4, atol=1e-8)
+
+
+def test_degenerate_directions(blending_method, interaction_directions, np_rng):
+    """Check finite, non-negative pdf and agreement with the mock reference when wo is exactly aligned/anti-aligned with wi"""
+    mei = interaction_directions
+    ctx = mi.PhaseFunctionContext(None)
+    grid = build_grid(np_rng, 2, 2)
+    rv_volumes = make_rv_volumes(np_rng, (10.5, 10.5), (0.15, 0.15))
+
+    phase, r_eff, v_eff, r_eff_grid, v_eff_grid, nodes, phase_mueller, grid_start, grid_len, sigma_s_weight = \
+        build_phase_function(grid, rv_volumes, blending_method)
+    mock = mock_phase(
+        r_eff, v_eff, r_eff_grid, v_eff_grid,
+        nodes, phase_mueller, grid_start, grid_len, sigma_s_weight, mei)
+
+    for wo in (mi.Vector3f(mei.wi), -mi.Vector3f(mei.wi)):
+        val, pdf = phase.eval_pdf(ctx, mei, wo)
+        pdf = float(dr.slice(pdf, 0))
+        assert np.all(np.isfinite(np.array(val)))
+        assert np.isfinite(pdf)
+        assert pdf >= 0.0
+
+        val_mock, pdf_mock = mock.eval_pdf(ctx, mei, wo)
+        assert np.isclose(pdf, float(dr.slice(pdf_mock, 0)), rtol=1e-4)
+        assert np.allclose(np.array(val), np.array(val_mock), rtol=1e-3, atol=1e-6)
+
+
+def test_llvm_variant(variant_llvm_ad_rgb, np_rng):
+    """Check that tabulate correctly refuses to instantiate under LLVM"""
+    grid = build_grid(np_rng, 2, 2)
+    rv_volumes = make_rv_volumes(np_rng, (10.5, 10.5), (0.15, 0.15))
+    with pytest.raises(Exception, match="tabulate"):
+        build_phase_function(grid, rv_volumes, "tabulate")
+
+
+def test_chi2(variants_vec_backends_once_rgb, np_rng):
+    """Check sample/pdf statistical consistency via a chi-squared test against the spherical domain"""
+    n_r, n_v = 2, 2
+    r_bounds, v_bounds = (4.0, 25.0), (0.1, 0.2)
+
+    nodes, grid_start, grid_len, phase_mueller = make_phase_grid(
+        np_rng, n_r=n_r, n_v=n_v, min_pts=20, max_pts=40,
+        array=mi.Float, array_u=mi.UInt32,
+    )
+    r_eff_grid, v_eff_grid, sigma_s_weight = make_rv_grid(
+        n_r=n_r, n_v=n_v, r_bounds=r_bounds, v_bounds=v_bounds,
+    )
+    r_eff_volume, v_eff_volume = make_rv_volumes(np_rng, r_bounds, v_bounds, shape=(1, 1, 1))
+
+    phase_dict = {
+        "type": "particlefieldphase",
+        "r_eff_volume": r_eff_volume,
+        "v_eff_volume": v_eff_volume,
+        "r_eff_grid": r_eff_grid,
+        "v_eff_grid": v_eff_grid,
+        "nodes": nodes,
+        "phase_mueller": phase_mueller,
+        "grid_start": grid_start,
+        "grid_len": grid_len,
+        "blending_method": "search",
+        "sigma_s_weight": sigma_s_weight,
+    }
+
+    sample_func, pdf_func = mi.chi2.PhaseFunctionAdapter("particlefieldphase", phase_dict)
+
+    chi2 = mi.chi2.ChiSquareTest(
+        domain=mi.chi2.SphericalDomain(),
+        sample_func=sample_func,
+        pdf_func=pdf_func,
+        sample_dim=3,
+    )
+
+    result = chi2.run()
+    assert result
