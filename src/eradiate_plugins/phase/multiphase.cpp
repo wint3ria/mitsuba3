@@ -52,28 +52,28 @@ multiple populations of scattering elements.
         <phase type="multiphase">
             <boolean name="use_mis" value="true"/>
             
-            <phase name="phase0" type="isotropic"/>
-            <float name="weight0" value="1.0"/>
-            <phase name="phase1" type="hg">
+            <phase name="phase_0" type="isotropic"/>
+            <float name="weight_0" value="1.0"/>
+            <phase name="phase_1" type="hg">
                 <float name="g" value="0.5"/>
             </phase>
-            <float name="weight1" value="1.0"/>
-            <phase name="phase2" type="hg">
+            <float name="weight_1" value="1.0"/>
+            <phase name="phase_2" type="hg">
                 <float name="g" value="0.2"/>
             </phase>
-            <float name="weight2" value="1.0"/>
+            <float name="weight_2" value="1.0"/>
         </phase>
 
     .. code-tab:: python
 
         'type': 'multiphase',
         'use_mis': True,
-        'phase0': {'type': 'isotropic'},
-        'weight0': 1.0,
-        'phase1': {'type': 'hg', 'g': 0.5},
-        'weight1': 1.0,
-        'phase2': {'type': 'hg', 'g': 0.2},
-        'weight2': 1.0
+        'phase_0': {'type': 'isotropic'},
+        'weight_0': 1.0,
+        'phase_1': {'type': 'hg', 'g': 0.5},
+        'weight_1': 1.0,
+        'phase_2': {'type': 'hg', 'g': 0.2},
+        'weight_2': 1.0
 
 */
 
@@ -90,7 +90,7 @@ public:
         for (auto &prop : props.objects()) {
             if (Base *phase = prop.try_get<Base>()) {
                 m_nested_phases.push_back(phase);
-                m_weights.push_back(props.get_volume<Volume>("weight" + std::to_string(phase_count)));
+                m_weights.push_back(props.get_volume<Volume>("weight_" + std::to_string(phase_count)));
                 phase_count++;
             }
         }
@@ -115,8 +115,8 @@ public:
 
     void traverse(TraversalCallback *cb) override {
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
-            cb->put("phase" + std::to_string(i), m_nested_phases[i], ParamFlags::Differentiable);
-            cb->put("weight" + std::to_string(i), m_weights[i], ParamFlags::Differentiable);
+            cb->put("phase_" + std::to_string(i), m_nested_phases[i], ParamFlags::Differentiable);
+            cb->put("weight_" + std::to_string(i), m_weights[i], ParamFlags::Differentiable);
         }
     }
 
@@ -182,6 +182,10 @@ public:
                     
                     for (size_t j = 0; j < m_nested_phases.size(); ++j) {
                         if (j == i) continue;
+
+                        // Ensure phases with zero weights are not called at all
+                        Mask mask_j = mask_i && (weight_values[j] > dr::Epsilon<Float>);
+                        if (!dr::any_or<true>(mask_j)) continue;
                         
                         auto [val_j, pdf_j] = m_nested_phases[j]->eval_pdf(
                             ctx, mi, wo_i, mask_i
@@ -192,7 +196,7 @@ public:
                     }
                     
                     Spectrum w_mis = dr::select(
-                        pdf_mixture > 1e-8f,
+                        pdf_mixture > dr::Epsilon<Float>,
                         phase_value_sum / pdf_mixture,
                         Spectrum(0.f)
                     );
@@ -231,7 +235,7 @@ public:
             weight_sum += weight_values.back();
         }
         
-        Float inv_weight_sum = dr::rcp(weight_sum);
+        Float inv_weight_sum = dr::select(weight_sum < dr::Epsilon<Float>, 1.0f, dr::rcp(weight_sum));
 
         if (unlikely(ctx.component != (uint32_t) -1)) {
             PhaseFunctionContext ctx2(ctx);
@@ -255,6 +259,11 @@ public:
         Float pdf = 0.f;
 
         for (size_t i = 0; i < m_nested_phases.size(); ++i) {
+
+            //Ensure zero weighted phases are never called
+            Mask mask_i = active && (weight_values[i] > dr::Epsilon<Float>);
+            if (!dr::any_or<true>(mask_i)) continue;
+            
             auto [val_i, pdf_i] = m_nested_phases[i]->eval_pdf(ctx, mi, wo, active);
             
             Float phase_weight = weight_values[i] * inv_weight_sum;
