@@ -166,7 +166,7 @@ public:
         m_max_density = dr::opaque<Float>(m_scale * m_sigmat->max());
         m_min_density = dr::opaque<Float>(m_scale * m_sigmat->min());
 
-// #ERADIATE_CHANGE_BEGIN: Refactored for extremum structure support
+// #ERADIATE_CHANGE_BEGIN: Refactored for extremum structure support and wrap mode
         for (auto &prop : props.objects()) {
             if (auto *extremum = prop.try_get<ExtremumStructure>()) {
                 if (m_extremum_structure)
@@ -182,6 +182,13 @@ public:
             props_extr.set("scale", m_scale);
             m_extremum_structure =
                 PluginManager::instance()->create_object<ExtremumStructure>(props_extr);
+        }
+
+        // Optional user-provided bbox override
+        if (props.has_property("aabb_min") && props.has_property("aabb_max")) {
+            ScalarPoint3f aabb_min = props.get<ScalarPoint3f>("aabb_min");
+            ScalarPoint3f aabb_max = props.get<ScalarPoint3f>("aabb_max");
+            m_aabb = ScalarBoundingBox3f(aabb_min, aabb_max);
         }
 // #ERADIATE_CHANGE_END
     }
@@ -232,7 +239,12 @@ public:
 
     std::tuple<Mask, Float, Float>
     intersect_aabb(const Ray3f &ray) const override {
+// #ERADIATE_CHANGE_BEGIN: Refactor wrap mode support
+        if (m_aabb.valid()) {
+            return m_aabb.ray_intersect(ray);
+        }
         return m_sigmat->bbox().ray_intersect(ray);
+// #ERADIATE_CHANGE_END
     }
 
     std::string to_string() const override {
@@ -255,6 +267,7 @@ private:
     Float m_max_density;
 // #ERADIATE_CHANGE_BEGIN: Refactored for extremum structure support
     Float m_min_density;
+    ScalarBoundingBox3f m_aabb;
 // #ERADIATE_CHANGE_END
 
     MI_TRAVERSE_CB(Base, m_sigmat, m_albedo, m_max_density)
