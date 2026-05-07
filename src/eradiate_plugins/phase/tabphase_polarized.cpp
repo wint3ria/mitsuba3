@@ -69,7 +69,7 @@ function of the cosine of the scattering angle.
      direction points *toward*, resp. *outward* the interaction point.
    * From this follows that :math:`\cos \theta = 1` corresponds to forward
      scattering.
-   * Lookup table points are regularly spaced between -1 and 1.
+   * The lookup table supports irregularly spaced points between -1 and 1.
    * Phase function values are automatically normalized.
    * For polarized phase functions, this assumes (for the time being) the
      structure of a phase function with spherically symmetric particles,
