@@ -65,12 +65,13 @@ public:
             return props.get_any<UInt32Storage>(name);
         };
 
-        m_r_eff_grid = load_float_grid("r_eff_grid");
-        m_v_eff_grid = load_float_grid("v_eff_grid");
-        m_nodes      = props.get_any<FloatStorage>("nodes");
-        m_mueller    = props.get_any<FloatStorage>("phase_mueller");
-        m_grid_start = load_uint_grid("grid_start");
-        m_grid_len   = load_uint_grid("grid_len");
+        m_r_eff_grid    = load_float_grid("r_eff_grid");
+        m_v_eff_grid    = load_float_grid("v_eff_grid");
+        m_nodes         = props.get_any<FloatStorage>("nodes");
+        m_mueller       = props.get_any<FloatStorage>("phase_mueller");
+        m_grid_start    = load_uint_grid("grid_start");
+        m_grid_len      = load_uint_grid("grid_len");
+        m_sigma_s_weight = props.get_any<FloatStorage>("sigma_s_weight");
 
         std::string method = props.get<std::string>("blending_method", "blended_cdf");
         if (method == "blended_cdf")
@@ -86,6 +87,8 @@ public:
             Throw("ParticlePhaseFunction: r_eff_grid must have n_r elements");
         if ((size_t) dr::width(m_v_eff_grid) != (size_t) m_n_v)
             Throw("ParticlePhaseFunction: v_eff_grid must have n_v elements");
+        if ((size_t) dr::width(m_sigma_s_weight) != (size_t)(m_n_r * m_n_v))
+            Throw("ParticlePhaseFunction: sigma_s_weight must have n_r * n_v = %d elements", m_n_r * m_n_v);
 
         if (props.has_property("cdf") && props.has_property("norm")) {
             m_cdf  = props.get_any<FloatStorage>("cdf");
@@ -241,6 +244,13 @@ public:
                           ir_hi * n_v + iv,
                           ir_hi * n_v + iv_hi);
         bw.w   = Vector4f(_tr * _tv, _tr * tv, tr * _tv, tr * tv);
+
+        // Scale by per-entry scattering coefficient and renormalise.
+        Vector4f sca  = dr::gather<Vector4f>(m_sigma_s_weight, bw.idx, active);
+        bw.w         *= sca;
+        Float sca_sum = dr::sum(bw.w);
+        bw.w          = dr::select(sca_sum > dr::Epsilon<Float>, bw.w / sca_sum, bw.w);
+
         return bw;
     }
 
@@ -616,10 +626,11 @@ public:
         cb->put("v_eff_volume",  m_v_eff_volume.get(), ParamFlags::NonDifferentiable);
         cb->put("r_eff_grid",    m_r_eff_grid,         ParamFlags::NonDifferentiable);
         cb->put("v_eff_grid",    m_v_eff_grid,         ParamFlags::NonDifferentiable);
-        cb->put("nodes",         m_nodes,              ParamFlags::NonDifferentiable);
-        cb->put("phase_mueller", m_mueller,            ParamFlags::NonDifferentiable);
-        cb->put("grid_start",    m_grid_start,         ParamFlags::NonDifferentiable);
-        cb->put("grid_len",      m_grid_len,           ParamFlags::NonDifferentiable);
+        cb->put("nodes",           m_nodes,              ParamFlags::NonDifferentiable);
+        cb->put("phase_mueller",   m_mueller,            ParamFlags::NonDifferentiable);
+        cb->put("grid_start",      m_grid_start,         ParamFlags::NonDifferentiable);
+        cb->put("grid_len",        m_grid_len,           ParamFlags::NonDifferentiable);
+        cb->put("sigma_s_weight",  m_sigma_s_weight,     ParamFlags::NonDifferentiable);
     }
 
     std::string to_string() const override {
@@ -649,6 +660,7 @@ private:
     UInt32Storage m_grid_len;
     FloatStorage  m_cdf;
     FloatStorage  m_norm;
+    FloatStorage  m_sigma_s_weight;
 
     int m_n_r = 0;
     int m_n_v = 0;
